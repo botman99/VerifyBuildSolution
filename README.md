@@ -1,6 +1,6 @@
 # Verify Build Solution
 
-Verify Build Solution is a Visual Studio extension for Unreal Engine 4 that will ask for confirmation before Building, Rebuilding, or Cleaning the Solution.  It does this by inserting itself into the Visual Studio User Interface and will display a dialog box asking for confirmation before building, rebuilding or cleaning the solution (but only if the solution is named UE4).  This Visual Studio extension supports Visual Studio 2015, 2017 and 2019.
+Verify Build Solution is a Visual Studio extension for Unreal Engine 4 and Unreal Engine 5 that will ask for confirmation before Building, Rebuilding, or Cleaning the Solution.  It does this by inserting itself into the Visual Studio User Interface and will display a dialog box asking for confirmation before building, rebuilding or cleaning the solution (but only if the solution is named UE4.sln or UE5.sln).  This Visual Studio extension supports Visual Studio 2017, 2019 and 2022.
 
 [![screenshot](https://github.com/botman99/VerifyBuildSolution/raw/master/RebuildWarning.png)](https://github.com/botman99/VerifyBuildSolution/raw/master/RebuildWarning.png)
 
