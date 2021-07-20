@@ -2,37 +2,14 @@
 // Copyright 2019 - Jeffrey "botman" Broome
 //
 
+using Microsoft.VisualStudio.Shell;
 using System;
-using System.ComponentModel.Design;
-using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.VisualStudio;
-using Microsoft.VisualStudio.OLE.Interop;
-using Microsoft.VisualStudio.Shell;
-using Microsoft.VisualStudio.Shell.Interop;
-using Microsoft.Win32;
 using Task = System.Threading.Tasks.Task;
-
-using EnvDTE;
-using EnvDTE80;
-using System.Windows.Forms;
-
-// NOTE: The instructions for converting a VS2015 VSIX Package to AsyncPackage can be found here:
-// https://docs.microsoft.com/en-us/visualstudio/extensibility/how-to-use-asyncpackage-to-load-vspackages-in-the-background?view=vs-2019
-
-// NOTE: Instructions on creating extensions for multiple Visual Studio versions can be found here:
-// https://docs.microsoft.com/en-us/archive/msdn-magazine/2017/august/visual-studio-creating-extensions-for-multiple-visual-studio-versions
-
-// NOTE: Instructions for building VSIX v3 format manifests (to make the VS2015 extension compatible with VS2017 and VS2019 can be found here:
-// https://github.com/MicrosoftDocs/visualstudio-docs/blob/master/docs/extensibility/faq-2017.md#can-i-build-a-vsix-v3-with-visual-studio-2015
-
-// NOTE: Also see these instructions on updating NuGet package to support the VSIXv3 schema:
-// https://docs.microsoft.com/en-us/visualstudio/extensibility/how-to-roundtrip-vsixs?view=vs-2019
-// (I had to create a folder named 'v3' under VerifyBuildSolution\packages\Microsoft.VSSDK.BuildTools.16.3.2099\tools\vssdk\schemas and move the *.xsd files there)
+using Microsoft.VisualStudio;
+using Microsoft.VisualStudio.Shell.Interop;
+using System.IO;
 
 namespace VerifyBuildSolution
 {
@@ -56,25 +33,20 @@ namespace VerifyBuildSolution
 	[PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
 	[InstalledProductRegistration("#110", "#112", "1.0", IconResourceID = 400)] // Info on this package for Help/About
 	[Guid(VSPackage.PackageGuidString)]
-	[SuppressMessage("StyleCop.CSharp.DocumentationRules", "SA1650:ElementDocumentationMustBeSpelledCorrectly", Justification = "pkgdef, VS and vsixmanifest are valid VS terms")]
 	[ProvideAutoLoad(VSConstants.UICONTEXT.SolutionOpening_string, PackageAutoLoadFlags.BackgroundLoad)]  // We want to auto load this extension so that it doesn't need to be activated by a command (it will always be available)
-	public sealed class VSPackage : AsyncPackage
+	public sealed class VSPackage : AsyncPackage, IVsUpdateSolutionEvents2
 	{
 		/// <summary>
 		/// VSPackage GUID string.
 		/// </summary>
 		public const string PackageGuidString = "2e208f6e-1d0e-436f-9b75-11b1219f32d5";
 
-		/// <summary>
-		/// Initializes a new instance of the <see cref="VSPackage"/> class.
-		/// </summary>
-		public VSPackage()
-		{
-			// Inside this method you can place any initialization code that does not require
-			// any Visual Studio service because at this point the package object is created but
-			// not sited yet inside Visual Studio environment. The place to do all the other
-			// initialization is the Initialize method.
-		}
+		private static AsyncPackage package;
+
+		private static bool bNeedToAskForConfirmation = false;
+		private static int LastCancelValue = 0;
+
+		const VSSOLNBUILDUPDATEFLAGS REBUILD = VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD | VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_FORCE_UPDATE;
 
 		#region Package Members
 
@@ -90,124 +62,110 @@ namespace VerifyBuildSolution
 			// When initialized asynchronously, the current thread may be a background thread at this point.
 			// Do any initialization that requires the UI thread after switching to the UI thread.
 			await this.JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
-			VerifyBuildSolutionTask.Initialize(this);
+
+			package = this;
+
+			IVsSolutionBuildManager buildManager = await GetServiceAsync(typeof(SVsSolutionBuildManager)) as IVsSolutionBuildManager;
+			if( buildManager != null)
+			{
+				uint buildManagerCookie;
+				buildManager.AdviseUpdateSolutionEvents(this, out buildManagerCookie);
+			}
 		}
 
-		#endregion
-	}
-
-	internal sealed class VerifyBuildSolutionTask
-	{
-		/// <summary>
-		/// VS Package that provides this command, not null.
-		/// </summary>
-		private readonly AsyncPackage package;
-		private static DTE2 dte2;
-
-		private static CommandEvents BuildCommandEvents;
-		private static CommandEvents RebuildCommandEvents;
-		private static CommandEvents CleanCommandEvents;
-
-		/// <summary>
-		/// Initializes a new instance of the <see cref="VerifyBuildSolutionTask"/> class.
-		/// Adds our command handlers for menu (commands must exist in the command table file)
-		/// </summary>
-		/// <param name="package">Owner package, not null.</param>
-		private VerifyBuildSolutionTask(AsyncPackage package)
+		// IVsUpdateSolutionEvents2 interface begin...
+		public int UpdateSolution_Begin(ref int pfCancelUpdate)
 		{
-			this.package = package;
+			bNeedToAskForConfirmation = true;
+			LastCancelValue = 0;
 
-			dte2 = Package.GetGlobalService(typeof(DTE)) as DTE2;
-
-			Events2 evs = dte2.Events as Events2;
-			Commands cmds = dte2.Commands;
-
-			Command cmdobj = cmds.Item("Build.BuildSolution", 0);
-			BuildCommandEvents = evs.get_CommandEvents(cmdobj.Guid, cmdobj.ID);
-			BuildCommandEvents.BeforeExecute += new _dispCommandEvents_BeforeExecuteEventHandler(VerifyBuildSolution);
-
-			cmdobj = cmds.Item("Build.RebuildSolution", 0);
-			RebuildCommandEvents = evs.get_CommandEvents(cmdobj.Guid, cmdobj.ID);
-			RebuildCommandEvents.BeforeExecute += new _dispCommandEvents_BeforeExecuteEventHandler(VerifyRebuildSolution);
-
-			cmdobj = cmds.Item("Build.CleanSolution", 0);
-			CleanCommandEvents = evs.get_CommandEvents(cmdobj.Guid, cmdobj.ID);
-			CleanCommandEvents.BeforeExecute += new _dispCommandEvents_BeforeExecuteEventHandler(VerifyCleanSolution);
+			return VSConstants.S_OK;
 		}
 
-		/// <summary>
-		/// Gets the instance of the command.
-		/// </summary>
-		public static VerifyBuildSolutionTask Instance
+		public int UpdateSolution_Done(int fSucceeded, int fModified, int fCancelCommand)
 		{
-			get;
-			private set;
+			return VSConstants.S_OK;
 		}
 
-		/// <summary>
-		/// Initializes the singleton instance of the command.
-		/// </summary>
-		/// <param name="package">Owner package, not null.</param>
-		public static void Initialize(AsyncPackage package)
+		public int UpdateSolution_StartUpdate(ref int pfCancelUpdate)
 		{
-			// Verify the current thread is the UI thread
+			return VSConstants.S_OK;
+		}
+
+		public int UpdateSolution_Cancel()
+		{
+			return VSConstants.S_OK;
+		}
+
+		public int OnActiveProjectCfgChange(IVsHierarchy pIVsHierarchy)
+		{
+			return VSConstants.S_OK;
+		}
+
+		public int UpdateProjectCfg_Begin(IVsHierarchy pHierProj, IVsCfg pCfgProj, IVsCfg pCfgSln, uint dwAction, ref int pfCancel)
+		{
 			ThreadHelper.ThrowIfNotOnUIThread();
 
-			Instance = new VerifyBuildSolutionTask(package);
+			if (bNeedToAskForConfirmation)
+			{
+				bNeedToAskForConfirmation = false;
+
+				string solutionDirectory = "";
+				string solutionName = "";
+				string solutionDirectory2 = "";
+
+				IVsSolution solution = (IVsSolution) Microsoft.VisualStudio.Shell.Package.GetGlobalService(typeof(IVsSolution));
+				solution.GetSolutionInfo(out solutionDirectory, out solutionName, out solutionDirectory2);
+
+				string solutionFileName = Path.GetFileName(solutionName).ToLower();
+
+				if ((solutionFileName == "ue4.sln") || (solutionFileName == "ue5.sln"))
+				{
+					string BuildType = "";
+
+					if (((VSSOLNBUILDUPDATEFLAGS)dwAction & REBUILD) == REBUILD)
+					{
+						BuildType = "Rebuild";
+					}
+					else if (((VSSOLNBUILDUPDATEFLAGS)dwAction & VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD) == VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD)
+					{
+						BuildType = "Build";
+					}
+					else if (((VSSOLNBUILDUPDATEFLAGS)dwAction & VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_CLEAN) == VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_CLEAN)
+					{
+						BuildType = "Clean";	
+					}
+
+					if (BuildType != "")
+					{
+						string message = String.Format("Do you want to {0} the Solution?", BuildType);
+						string title = "WARNING!";
+
+						int result = VsShellUtilities.ShowMessageBox(package, message, title, OLEMSGICON.OLEMSGICON_WARNING, OLEMSGBUTTON.OLEMSGBUTTON_YESNO, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
+
+						if (result == (int)VSConstants.MessageBoxResult.IDNO)  // do we want to cancel the build?
+						{
+							LastCancelValue = 1;
+						}
+						else
+						{
+							LastCancelValue = 0;
+						}
+					}
+				}
+			}
+
+			pfCancel = LastCancelValue;
+
+			return VSConstants.S_OK;
 		}
 
-		private static void VerifyBuildSolution(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
+		public int UpdateProjectCfg_Done(IVsHierarchy pHierProj, IVsCfg pCfgProj, IVsCfg pCfgSln, uint dwAction, int fSuccess, int fCancel)
 		{
-			string solution_name = System.IO.Path.GetFileNameWithoutExtension(dte2.Solution.FullName).ToLower();
-
-			if (solution_name != "ue4")
-			{
-				return;
-			}
-
-			DialogResult result = MessageBox.Show(null, "Do you want to Build the Solution", "WARNING!", MessageBoxButtons.YesNo,
-				MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-
-			if (result == DialogResult.No)
-			{
-				CancelDefault = true;
-			}
+			return VSConstants.S_OK;
 		}
+		// IVsUpdateSolutionEvents2 interface end...
 
-		private static void VerifyRebuildSolution(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
-		{
-			string solution_name = System.IO.Path.GetFileNameWithoutExtension(dte2.Solution.FullName).ToLower();
-
-			if (solution_name != "ue4")
-			{
-				return;
-			}
-
-			DialogResult result = MessageBox.Show(null, "Do you want to Rebuild the Solution", "WARNING!", MessageBoxButtons.YesNo,
-				MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-
-			if (result == DialogResult.No)
-			{
-				CancelDefault = true;
-			}
-		}
-
-		private static void VerifyCleanSolution(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
-		{
-			string solution_name = System.IO.Path.GetFileNameWithoutExtension(dte2.Solution.FullName).ToLower();
-
-			if (solution_name != "ue4")
-			{
-				return;
-			}
-
-			DialogResult result = MessageBox.Show(null, "Do you want to Clean the Solution", "WARNING!", MessageBoxButtons.YesNo,
-				MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-
-			if (result == DialogResult.No)
-			{
-				CancelDefault = true;
-			}
-		}
+		#endregion
 	}
 }
