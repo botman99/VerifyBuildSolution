@@ -2,14 +2,16 @@
 // Copyright 2019 - Jeffrey "botman" Broome
 //
 
-using Microsoft.VisualStudio.Shell;
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Microsoft.VisualStudio.Shell;
 using Task = System.Threading.Tasks.Task;
+
+using EnvDTE;
+using EnvDTE80;
 using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.Shell.Interop;
-using System.IO;
 
 namespace VerifyBuildSolution
 {
@@ -34,7 +36,7 @@ namespace VerifyBuildSolution
 	[InstalledProductRegistration("#110", "#112", "1.0", IconResourceID = 400)] // Info on this package for Help/About
 	[Guid(VSPackage.PackageGuidString)]
 	[ProvideAutoLoad(VSConstants.UICONTEXT.SolutionOpening_string, PackageAutoLoadFlags.BackgroundLoad)]  // We want to auto load this extension so that it doesn't need to be activated by a command (it will always be available)
-	public sealed class VSPackage : AsyncPackage, IVsUpdateSolutionEvents2
+	public sealed class VSPackage : AsyncPackage
 	{
 		/// <summary>
 		/// VSPackage GUID string.
@@ -42,11 +44,11 @@ namespace VerifyBuildSolution
 		public const string PackageGuidString = "2e208f6e-1d0e-436f-9b75-11b1219f32d5";
 
 		private static AsyncPackage package;
+		private static DTE2 dte2;
 
-		private static bool bNeedToAskForConfirmation = false;
-		private static int LastCancelValue = 0;
-
-		const VSSOLNBUILDUPDATEFLAGS REBUILD = VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD | VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_FORCE_UPDATE;
+		private static CommandEvents BuildCommandEvents;
+		private static CommandEvents RebuildCommandEvents;
+		private static CommandEvents CleanCommandEvents;
 
 		#region Package Members
 
@@ -65,106 +67,101 @@ namespace VerifyBuildSolution
 
 			package = this;
 
-			IVsSolutionBuildManager buildManager = await GetServiceAsync(typeof(SVsSolutionBuildManager)) as IVsSolutionBuildManager;
-			if( buildManager != null)
-			{
-				uint buildManagerCookie;
-				buildManager.AdviseUpdateSolutionEvents(this, out buildManagerCookie);
-			}
+			dte2 = Package.GetGlobalService(typeof(DTE)) as DTE2;
+
+			Events2 evs = dte2.Events as Events2;
+			Commands cmds = dte2.Commands;
+
+			Command cmdobj = cmds.Item("Build.BuildSolution", 0);
+			BuildCommandEvents = evs.get_CommandEvents(cmdobj.Guid, cmdobj.ID);
+			BuildCommandEvents.BeforeExecute += new _dispCommandEvents_BeforeExecuteEventHandler(VerifyBuildSolution);
+
+			cmdobj = cmds.Item("Build.RebuildSolution", 0);
+			RebuildCommandEvents = evs.get_CommandEvents(cmdobj.Guid, cmdobj.ID);
+			RebuildCommandEvents.BeforeExecute += new _dispCommandEvents_BeforeExecuteEventHandler(VerifyRebuildSolution);
+
+			cmdobj = cmds.Item("Build.CleanSolution", 0);
+			CleanCommandEvents = evs.get_CommandEvents(cmdobj.Guid, cmdobj.ID);
+			CleanCommandEvents.BeforeExecute += new _dispCommandEvents_BeforeExecuteEventHandler(VerifyCleanSolution);
 		}
 
-		// IVsUpdateSolutionEvents2 interface begin...
-		public int UpdateSolution_Begin(ref int pfCancelUpdate)
-		{
-			bNeedToAskForConfirmation = true;
-			LastCancelValue = 0;
-
-			return VSConstants.S_OK;
-		}
-
-		public int UpdateSolution_Done(int fSucceeded, int fModified, int fCancelCommand)
-		{
-			return VSConstants.S_OK;
-		}
-
-		public int UpdateSolution_StartUpdate(ref int pfCancelUpdate)
-		{
-			return VSConstants.S_OK;
-		}
-
-		public int UpdateSolution_Cancel()
-		{
-			return VSConstants.S_OK;
-		}
-
-		public int OnActiveProjectCfgChange(IVsHierarchy pIVsHierarchy)
-		{
-			return VSConstants.S_OK;
-		}
-
-		public int UpdateProjectCfg_Begin(IVsHierarchy pHierProj, IVsCfg pCfgProj, IVsCfg pCfgSln, uint dwAction, ref int pfCancel)
+		private static void VerifyBuildSolution(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
 		{
 			ThreadHelper.ThrowIfNotOnUIThread();
 
-			if (bNeedToAskForConfirmation)
+			string solution_name = System.IO.Path.GetFileNameWithoutExtension(dte2.Solution.FullName).ToLower();
+
+			if ((solution_name != "ue4") && (solution_name != "ue5"))
 			{
-				bNeedToAskForConfirmation = false;
-
-				string solutionDirectory = "";
-				string solutionName = "";
-				string solutionDirectory2 = "";
-
-				IVsSolution solution = (IVsSolution) Microsoft.VisualStudio.Shell.Package.GetGlobalService(typeof(IVsSolution));
-				solution.GetSolutionInfo(out solutionDirectory, out solutionName, out solutionDirectory2);
-
-				string solutionFileName = Path.GetFileName(solutionName).ToLower();
-
-				if ((solutionFileName == "ue4.sln") || (solutionFileName == "ue5.sln"))
-				{
-					string BuildType = "";
-
-					if (((VSSOLNBUILDUPDATEFLAGS)dwAction & REBUILD) == REBUILD)
-					{
-						BuildType = "Rebuild";
-					}
-					else if (((VSSOLNBUILDUPDATEFLAGS)dwAction & VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD) == VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_BUILD)
-					{
-						BuildType = "Build";
-					}
-					else if (((VSSOLNBUILDUPDATEFLAGS)dwAction & VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_CLEAN) == VSSOLNBUILDUPDATEFLAGS.SBF_OPERATION_CLEAN)
-					{
-						BuildType = "Clean";	
-					}
-
-					if (BuildType != "")
-					{
-						string message = String.Format("Do you want to {0} the Solution?", BuildType);
-						string title = "WARNING!";
-
-						int result = VsShellUtilities.ShowMessageBox(package, message, title, OLEMSGICON.OLEMSGICON_WARNING, OLEMSGBUTTON.OLEMSGBUTTON_YESNO, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
-
-						if (result == (int)VSConstants.MessageBoxResult.IDNO)  // do we want to cancel the build?
-						{
-							LastCancelValue = 1;
-						}
-						else
-						{
-							LastCancelValue = 0;
-						}
-					}
-				}
+				return;
 			}
 
-			pfCancel = LastCancelValue;
+			string message = "Do you want to Build the Solution?";
+			string title = "WARNING!";
 
-			return VSConstants.S_OK;
+			int result = VsShellUtilities.ShowMessageBox(package, message, title, OLEMSGICON.OLEMSGICON_WARNING, OLEMSGBUTTON.OLEMSGBUTTON_YESNO, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
+
+			if (result == (int)VSConstants.MessageBoxResult.IDNO)  // do we want to cancel the build?
+			{
+				CancelDefault = true;
+			}
+			else
+			{
+				CancelDefault = false;
+			}
 		}
 
-		public int UpdateProjectCfg_Done(IVsHierarchy pHierProj, IVsCfg pCfgProj, IVsCfg pCfgSln, uint dwAction, int fSuccess, int fCancel)
+		private static void VerifyRebuildSolution(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
 		{
-			return VSConstants.S_OK;
+			ThreadHelper.ThrowIfNotOnUIThread();
+
+			string solution_name = System.IO.Path.GetFileNameWithoutExtension(dte2.Solution.FullName).ToLower();
+
+			if ((solution_name != "ue4") && (solution_name != "ue5"))
+			{
+				return;
+			}
+
+			string message = "Do you want to Rebuild the Solution?";
+			string title = "WARNING!";
+
+			int result = VsShellUtilities.ShowMessageBox(package, message, title, OLEMSGICON.OLEMSGICON_WARNING, OLEMSGBUTTON.OLEMSGBUTTON_YESNO, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
+
+			if (result == (int)VSConstants.MessageBoxResult.IDNO)  // do we want to cancel the rebuild?
+			{
+				CancelDefault = true;
+			}
+			else
+			{
+				CancelDefault = false;
+			}
 		}
-		// IVsUpdateSolutionEvents2 interface end...
+
+		private static void VerifyCleanSolution(string Guid, int ID, object CustomIn, object CustomOut, ref bool CancelDefault)
+		{
+			ThreadHelper.ThrowIfNotOnUIThread();
+
+			string solution_name = System.IO.Path.GetFileNameWithoutExtension(dte2.Solution.FullName).ToLower();
+
+			if ((solution_name != "ue4") && (solution_name != "ue5"))
+			{
+				return;
+			}
+
+			string message = "Do you want to Clean the Solution?";
+			string title = "WARNING!";
+
+			int result = VsShellUtilities.ShowMessageBox(package, message, title, OLEMSGICON.OLEMSGICON_WARNING, OLEMSGBUTTON.OLEMSGBUTTON_YESNO, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_SECOND);
+
+			if (result == (int)VSConstants.MessageBoxResult.IDNO)  // do we want to cancel the clean?
+			{
+				CancelDefault = true;
+			}
+			else
+			{
+				CancelDefault = false;
+			}
+		}
 
 		#endregion
 	}
